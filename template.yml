@@ -1,0 +1,194 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  REST API Gateway to EventBridge
+
+Resources:
+##################
+#   Event Bus    #
+##################
+  EventBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: CarDetailsBus
+
+########################
+#   Audi Rule + SQS    #
+########################
+  AudiQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: audi-queue
+
+  AudiEventsRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: "Rule to capture Audi events and send to AudiQueue"
+      EventBusName: !GetAtt EventBus.Name
+      EventPattern:
+        source:
+          - "car_data"
+        detail-type:
+          - "audi"
+      Targets:
+        - Arn: !GetAtt AudiQueue.Arn
+          Id: "AudiQueueTarget"  
+
+  AudiQueuePermission:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      PolicyDocument:
+        Statement:
+          - Sid: "AudiQueuePermission"
+            Effect: "Allow"
+            Principal:
+              Service: 'events.amazonaws.com'
+            Action: "SQS:SendMessage"
+            Resource: !GetAtt AudiQueue.Arn
+      Queues: 
+        - !Ref AudiQueue
+
+#######################
+#   BMW Rule + SQS    #
+#######################
+  BmwQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: bmw-queue
+
+  BmwEventsRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: "Rule to capture Bmw events and send to BmwQueue"
+      EventBusName: !GetAtt EventBus.Name
+      EventPattern:
+        source:
+          - "car_data"
+        detail-type:
+          - "bmw"
+      Targets:
+        - Arn: !GetAtt BmwQueue.Arn
+          Id: "BmwQueueTarget"  
+
+  BmwQueuePermission:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      PolicyDocument:
+        Statement:
+          - Sid: AudiQueuePermission
+            Effect: "Allow"
+            Principal:
+              Service: events.amazonaws.com
+            Action: 'SQS:SendMessage'
+            Resource: !GetAtt BmwQueue.Arn
+      Queues: 
+        - !Ref BmwQueue
+
+#############################
+# IAM Role for API Gateway  #
+#############################
+  ApiGatewayRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Sid: AssumeByApiGateway
+            Effect: Allow
+            Action:
+              - 'sts:AssumeRole'
+            Principal:
+              Service:
+                - apigateway.amazonaws.com
+      Policies:
+        - PolicyName: PutEvents
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'events:PutEvents'
+                Resource:
+                  - !GetAtt EventBus.Arn
+  
+#######################
+#   Rest API Gateway  #
+#######################
+  apiGateway:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      Name: car-details-api
+
+#######################
+#   Rest API Resource #
+#######################
+  apiGatewayResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      ParentId: !GetAtt apiGateway.RootResourceId
+      PathPart: CarDetails
+      RestApiId: !Ref apiGateway
+
+##########################
+#   API Gateway Method   #
+##########################
+  apiGatewayRootMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      HttpMethod: POST
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: Empty
+      Integration:
+        IntegrationHttpMethod: POST
+        Type: AWS
+        Credentials: !GetAtt ApiGatewayRole.Arn 
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:events:action/PutEvents
+        PassthroughBehavior: WHEN_NO_TEMPLATES
+        RequestTemplates: 
+          application/json: !Sub 
+            - |- 
+              #set($context.requestOverride.header.X-Amz-Target = "AWSEvents.PutEvents")
+              #set($context.requestOverride.header.Content-Type = "application/x-amz-json-1.1")            
+              #set($inputRoot = $input.path('$')) 
+              { 
+                "Entries": [
+                  #foreach($elem in $inputRoot.items)
+                  {
+                    "Detail": "$util.escapeJavaScript($elem.CarData).replaceAll("\\'","'")",
+                    "DetailType": "$elem.BrandType",
+                    "Source": "$elem.Source",
+                    "EventBusName": "${EventBusName}"
+                  }#if($foreach.hasNext),#end
+                  #end
+                ]
+              }
+            - { EventBusName: !Ref EventBus }
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseTemplates: 
+              application/json: !Sub 
+                - |- 
+                  #set($inputRoot = $input.path('$'))
+                  {
+                  }
+                - {}
+      ResourceId: !Ref apiGatewayResource
+      RestApiId: !Ref apiGateway
+
+############################
+#   Api Gateway Deployment #
+############################
+  apiGatewayDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - apiGatewayRootMethod
+    Properties:
+      RestApiId: !Ref apiGateway
+      StageName: 'prod'
+
